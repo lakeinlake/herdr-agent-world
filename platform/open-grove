@@ -1,0 +1,25 @@
+#!/bin/sh
+# Attach/open through the single persistent service owner.
+set -eu
+grove_here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ "$(uname -s)" = Darwin ]; then
+  grove_data=${GROVE_DATA_DIR:-"$HOME/Library/Application Support/Herdr Grove"}
+else
+  grove_data=${GROVE_DATA_DIR:-"${XDG_DATA_HOME:-$HOME/.local/share}/herdr-grove"}
+fi
+grove_binary=${GROVE_BIN:-"$grove_data/bin/grove"}
+if [ ! -x "$grove_binary" ] && [ -z "${GROVE_BIN:-}" ]; then
+  grove_binary="$grove_here/../target/release/grove"
+fi
+if [ ! -x "$grove_binary" ]; then
+  echo 'Grove executable unavailable. Build cargo build --release --locked, then install/start the service as described in README.md.' >&2
+  exit 1
+fi
+if [ -z "${GROVE_BIN:-}" ] && [ -z "${GROVE_DATA_DIR:-}" ]; then
+  grove_helper="$grove_data/bin/grove-service"
+  if [ -x "$grove_helper" ]; then
+    [ "${HERDR_ENV:-}" = 1 ] || { echo 'Open Grove from a shell pane inside Herdr.' >&2; exit 1; }
+    "$grove_helper" start
+  fi
+fi
+exec "$grove_binary" open --state-dir "$grove_data" "$@"

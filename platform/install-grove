@@ -1,0 +1,208 @@
+#!/bin/sh
+# Called by install.sh after platform, context and download verification.
+set -eu
+umask 077
+fail() { echo "Grove installation failed: $*" >&2; exit 1; }
+grove_package=$1
+grove_shortcuts=$2
+grove_open=$3
+grove_mode=${4:-}
+case "$grove_mode" in ''|--service-only) ;; *) fail 'unknown installation mode' ;; esac
+grove_os=$(uname -s)
+case "$grove_os" in
+  Darwin)
+    grove_data=${GROVE_DATA_DIR:-"$HOME/Library/Application Support/Herdr Grove"}
+    grove_agents=${GROVE_LAUNCH_AGENTS_DIR:-"$HOME/Library/LaunchAgents"}
+    grove_service=platform/macos/grove-service
+    ;;
+  Linux)
+    grove_data=${GROVE_DATA_DIR:-"${XDG_DATA_HOME:-$HOME/.local/share}/herdr-grove"}
+    grove_service=platform/linux/grove-service
+    ;;
+  *) fail 'unsupported installer platform' ;;
+esac
+grove_zsh=0
+if [ "$grove_os" = Darwin ] || command -v zsh >/dev/null 2>&1; then grove_zsh=1; fi
+grove_wsl=0
+case "$(uname -r | tr '[:upper:]' '[:lower:]')" in *microsoft*) grove_wsl=1 ;; esac
+grove_label=${GROVE_SERVICE_LABEL:-local.herdr-grove}
+grove_zshdir=${ZDOTDIR:-$HOME}
+grove_plugin="$grove_data/plugin"
+grove_rc="$grove_zshdir/.zshrc"
+
+grove_cr=$(printf '\r')
+safe_path() {
+  case "$1" in /*) ;; *) fail 'installation paths must be absolute' ;; esac
+  case "/$1/" in */../*|*/./*) fail 'installation paths cannot contain dot components' ;; esac
+  case "$1" in *'
+'*|*"$grove_cr"*) fail 'installation paths cannot contain line breaks' ;; esac
+  grove_check=$1
+  while [ "$grove_check" != / ]; do
+    # macOS supplies these system aliases, unlike user-controlled symlinks.
+    if [ "$grove_os" = Darwin ]; then
+      case "$grove_check" in /tmp|/var) break ;; esac
+    fi
+    [ ! -L "$grove_check" ] || fail "refusing symlink: $grove_check"
+    grove_check=$(dirname -- "$grove_check")
+  done
+  if [ "$grove_wsl" = 1 ]; then
+    case "$1" in /mnt/*) fail 'WSL installation requires Linux filesystem storage, outside Windows mounts' ;; esac
+    grove_existing=$1
+    while [ ! -e "$grove_existing" ]; do grove_existing=$(dirname -- "$grove_existing"); done
+    command -v findmnt >/dev/null 2>&1 || fail 'findmnt is required to verify WSL Linux filesystem storage'
+    grove_existing=$(CDPATH= cd -- "$grove_existing" 2>/dev/null && pwd -P) || grove_existing=$(CDPATH= cd -- "$(dirname -- "$grove_existing")" && pwd -P)
+    case "$grove_existing" in /mnt/*) fail 'WSL installation requires Linux filesystem storage' ;; esac
+    grove_fs=$(findmnt -n -o FSTYPE -T "$grove_existing") || fail 'cannot verify WSL installation filesystem'
+    case "$grove_fs" in drvfs|9p|ntfs|ntfs3|fuseblk) fail 'WSL installation requires Linux filesystem storage' ;; esac
+  fi
+}
+if [ "$grove_os" = Darwin ]; then safe_path "$grove_agents/$grove_label.plist"; fi
+for grove_path in "$grove_data" "$grove_data/bin/grove" "$grove_data/bin/grove-service" "$grove_data/logs/stdout.log" "$grove_data/logs/stderr.log"; do
+  safe_path "$grove_path"
+done
+case "$grove_label" in local.herdr-grove|local.herdr-grove.*) ;; *) fail 'invalid service label' ;; esac
+case "$grove_label" in *[!a-zA-Z0-9._-]*) fail 'invalid service label' ;; esac
+grove_port=${GROVE_PORT:-43821}
+case "$grove_port" in ''|*[!0-9]*) fail 'invalid service port' ;; esac
+[ "$grove_port" -le 65535 ] || fail 'invalid service port'
+for grove_file in herdr-plugin.toml platform/open-grove platform/grove.zsh $grove_service skills/grove/SKILL.md target/release/grove; do
+  safe_path "$grove_package/$grove_file"
+  [ -f "$grove_package/$grove_file" ] && [ ! -L "$grove_package/$grove_file" ] || fail "package resource missing or unsafe: $grove_file"
+done
+[ -x "$grove_package/target/release/grove" ] || fail 'package binary is not executable; build cargo build --release --locked first'
+if [ "$grove_mode" = --service-only ]; then
+  if [ "$grove_os" = Linux ]; then
+    sh "$grove_package/$grove_service" preflight || fail 'Linux service preflight failed; nothing replaced'
+  fi
+  echo 'Installing Herdr Agent World; upgrades restart its service and require workspace attachment again.'
+  sh "$grove_package/$grove_service" install "$grove_package/target/release/grove" || fail 'service setup failed; saved Grove data is preserved; resolve the reported error and retry installation'
+  echo 'Service installed. Use Open Herdr Agent World in Herdr to attach your workspace.'
+  exit 0
+fi
+safe_path "$grove_plugin"
+if [ -e "$grove_plugin" ]; then
+  [ -d "$grove_plugin" ] && [ -f "$grove_plugin/.grove-installer-owned" ] && [ ! -L "$grove_plugin/.grove-installer-owned" ] || fail 'stable plugin path already contains unrelated files'
+  [ "$(cat "$grove_plugin/.grove-installer-owned")" = local.herdr-grove ] || fail 'stable plugin path is not owned by this installer'
+fi
+
+preflight_skill() {
+  safe_path "$1/SKILL.md"
+  safe_path "$1/.grove-installer-owned"
+  if [ -e "$1" ]; then
+    [ -d "$1" ] && [ -f "$1/SKILL.md" ] || fail "unrelated Grove skill exists: $1"
+    # Refuse mixing owned installation files with unrelated user additions.
+    for grove_item in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+      [ -e "$grove_item" ] || [ -L "$grove_item" ] || continue
+      case "$grove_item" in "$1/SKILL.md"|"$1/.grove-installer-owned") ;; *) fail "unrelated files in Grove skill: $1" ;; esac
+    done
+    if [ -f "$1/.grove-installer-owned" ]; then
+      [ "$(cat "$1/.grove-installer-owned")" = local.herdr-grove ] || fail "unrelated Grove skill marker: $1"
+    elif ! cmp -s "$1/SKILL.md" "$grove_package/skills/grove/SKILL.md"; then
+      if command -v sha256sum >/dev/null 2>&1; then
+        grove_hash=$(sha256sum "$1/SKILL.md" | awk '{print $1}')
+      else grove_hash=$(shasum -a 256 "$1/SKILL.md" | awk '{print $1}'); fi
+      [ "$grove_hash" = cbd6840afbb5a2189395d708dd4a50ed4688bd6853d6c3e5da8504f9f5de642b ] || fail "unrelated Grove skill exists: $1"
+    fi
+  fi
+}
+grove_codex=0
+grove_claude=0
+grove_legacy=
+if [ "$grove_shortcuts" = 1 ]; then
+  if [ "$grove_zsh" = 1 ]; then
+    safe_path "$grove_rc"
+    [ ! -e "$grove_rc" ] || [ -f "$grove_rc" ] || fail 'zsh configuration is not a regular file'
+    if [ -f "$grove_rc" ]; then
+      awk 'BEGIN {direct="(^|[[:space:];])(function|alias)[[:space:]]+(-[[:alnum:]]+[[:space:]]+)*[\"\047]?/grove[\"\047]?([[:space:]]|=|\\(|$)"}
+        /^# >>> Herdr Grove >>>$/ {if (inside || seen++) exit 1; inside=1}
+        /^# <<< Herdr Grove <<<$/{if (!inside) exit 1; inside=0}
+        !inside && $0 !~ /^[[:space:]]*#/ {
+          if ($0 ~ /(^|[[:space:];])\/grove[[:space:]]*\([[:space:]]*\)/ || $0 ~ direct) exit 1
+        }
+        END {if (inside) exit 1}' "$grove_rc" || fail 'zsh has a malformed Grove block or conflicting /grove definition; repair it or use --no-shortcuts'
+      grove_legacy=$(awk '/^# Herdr Grove opening shortcuts$/ {
+        if (seen++ || getline <= 0 || $0 !~ /^source "\/.*\/platform\/grove\.zsh"$/) exit 1
+        print substr($0,9,length($0)-9)
+      }' "$grove_rc") || fail 'unrecognized previous Grove shell shortcut; repair it or use --no-shortcuts'
+      if [ -n "$grove_legacy" ]; then
+        [ -f "$grove_legacy" ] && cmp -s "$grove_legacy" "$grove_package/platform/grove.zsh" || fail 'previous Grove shell helper differs from this package; use --no-shortcuts or remove its startup entry'
+      fi
+    fi
+  fi
+  if command -v codex >/dev/null 2>&1; then grove_codex=1; preflight_skill "$HOME/.agents/skills/grove"; fi
+  if command -v claude >/dev/null 2>&1; then grove_claude=1; preflight_skill "$HOME/.claude/skills/grove"; fi
+fi
+
+if [ "$grove_os" = Linux ]; then
+  sh "$grove_package/$grove_service" preflight || fail 'Linux service preflight failed; nothing replaced'
+fi
+# Finish validation before replacing files or asking the owner to stop a service.
+mkdir -p "$grove_data"
+chmod 700 "$grove_data"
+grove_stage=$(mktemp -d "$grove_data/.installer.XXXXXX")
+trap 'rm -rf "$grove_stage"' EXIT
+trap 'exit 130' HUP INT TERM
+mkdir -p "$grove_stage/plugin/platform" "$grove_stage/plugin/skills/grove"
+cp "$grove_package/herdr-plugin.toml" "$grove_stage/plugin/"
+cp "$grove_package/platform/open-grove" "$grove_package/platform/grove.zsh" "$grove_stage/plugin/platform/"
+cp "$grove_package/skills/grove/SKILL.md" "$grove_stage/plugin/skills/grove/"
+printf '%s\n' local.herdr-grove > "$grove_stage/plugin/.grove-installer-owned"
+chmod 700 "$grove_stage/plugin/platform/open-grove"
+
+if [ "$grove_shortcuts" = 1 ] && [ "$grove_zsh" = 1 ]; then
+  if [ -f "$grove_rc" ]; then
+    awk '/^# >>> Herdr Grove >>>$/ {inside=1; next}
+      /^# <<< Herdr Grove <<<$/{inside=0; next}
+      /^# Herdr Grove opening shortcuts$/ {getline; next}
+      !inside {print}' "$grove_rc" > "$grove_stage/zshrc"
+  else : > "$grove_stage/zshrc"; fi
+  grove_quoted=$(printf '%s' "$grove_plugin/platform/grove.zsh" | sed "s/'/'\\\\''/g")
+  printf '# >>> Herdr Grove >>>\nsource '\''%s'\''\n# <<< Herdr Grove <<<\n' "$grove_quoted" >> "$grove_stage/zshrc"
+fi
+
+echo 'Installing Grove; upgrades restart its service and require workspace attachment again.'
+if ! sh "$grove_package/$grove_service" install "$grove_package/target/release/grove"; then
+  fail 'service setup failed; saved Grove data is preserved; retry the installer after resolving the reported error'
+fi
+if [ -d "$grove_plugin" ]; then mv "$grove_plugin" "$grove_stage/previous-plugin"; fi
+if ! mv "$grove_stage/plugin" "$grove_plugin"; then
+  [ ! -d "$grove_stage/previous-plugin" ] || mv "$grove_stage/previous-plugin" "$grove_plugin"
+  fail 'could not replace plugin resources; the service was installed, but the plugin was not updated'
+fi
+if ! herdr plugin link "$grove_plugin"; then
+  fail 'service installed, but Herdr plugin registration failed; rerun this installer to retry'
+fi
+
+install_skill() {
+  mkdir -p "$1"
+  cp "$grove_package/skills/grove/SKILL.md" "$grove_stage/SKILL.md"
+  mv "$grove_stage/SKILL.md" "$1/SKILL.md"
+  printf '%s\n' local.herdr-grove > "$1/.grove-installer-owned"
+}
+if [ "$grove_shortcuts" = 1 ]; then
+  if [ "$grove_zsh" = 1 ]; then
+    mkdir -p "$grove_zshdir"
+    if ! cmp -s "$grove_stage/zshrc" "$grove_rc"; then
+      if [ -f "$grove_rc" ]; then
+        grove_backup=$(mktemp "$grove_rc.grove-backup.XXXXXX")
+        cp -p "$grove_rc" "$grove_backup"
+        echo "zsh configuration backup: $grove_backup"
+      fi
+      grove_rc_temp=$(mktemp "$grove_zshdir/.grove-zshrc.XXXXXX")
+      cp "$grove_stage/zshrc" "$grove_rc_temp"
+      mv "$grove_rc_temp" "$grove_rc"
+    fi
+  fi
+  [ "$grove_codex" = 0 ] || install_skill "$HOME/.agents/skills/grove"
+  [ "$grove_claude" = 0 ] || install_skill "$HOME/.claude/skills/grove"
+  if [ "$grove_zsh" = 1 ]; then
+    echo 'New Herdr zsh shells can use /grove. Existing shells must reload .zshrc.'
+  else echo 'zsh is unavailable; no zsh configuration was added.'; fi
+  echo 'Detected agents received the Grove skill; refresh their skill list if needed.'
+fi
+if [ "$grove_open" = 1 ]; then
+  if ! herdr plugin action invoke open --plugin local.herdr-grove; then
+    fail 'Grove is installed, but opening/attaching failed; retry /grove inside Herdr'
+  fi
+fi
+echo 'Grove installation complete.'

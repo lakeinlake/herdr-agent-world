@@ -1,0 +1,16 @@
+id = "local.herdr-grove"
+name = "Herdr Agent World"
+version = "0.2.0"
+description = "Watch your coding agents work as animated characters."
+min_herdr_version = "0.8.0"
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["sh", "install.sh", "--marketplace"]
+
+[[actions]]
+id = "open"
+title = "Open Herdr Agent World"
+description = "Open Agent World for this workspace"
+command = ["sh", "platform/open-grove"]
+contexts = ["workspace", "tab", "pane"]

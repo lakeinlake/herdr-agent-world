@@ -1,0 +1,170 @@
+#!/bin/sh
+# A user systemd unit or an explicitly recorded detached-process owner.
+set -eu
+umask 077
+fail() { echo "Grove service: $*" >&2; exit 1; }
+[ "$(uname -s)" = Linux ] || fail 'this helper requires Linux or WSL2'
+grove_data=${GROVE_DATA_DIR:-"${XDG_DATA_HOME:-$HOME/.local/share}/herdr-grove"}
+grove_config=${XDG_CONFIG_HOME:-"$HOME/.config"}
+grove_label=${GROVE_SERVICE_LABEL:-local.herdr-grove}
+grove_port=${GROVE_PORT:-43821}
+case "$grove_label" in local.herdr-grove|local.herdr-grove.*) ;; *) fail 'invalid service label' ;; esac
+case "$grove_label" in *[!a-zA-Z0-9._-]*) fail 'invalid service label' ;; esac
+case "$grove_port" in ''|*[!0-9]*) fail 'invalid service port' ;; esac
+[ "$grove_port" -le 65535 ] || fail 'invalid service port'
+grove_binary="$grove_data/bin/grove"
+grove_helper="$grove_data/bin/grove-service"
+grove_logs="$grove_data/logs"
+grove_manager_file="$grove_data/service-manager"
+grove_unit="$grove_config/systemd/user/$grove_label.service"
+grove_unit_name="$grove_label.service"
+grove_wsl=0
+# GNU timeout bounds manager operations as well as socket readiness.
+command -v timeout >/dev/null 2>&1 || fail 'timeout is required'
+command -v flock >/dev/null 2>&1 || fail 'flock is required'
+userctl() { timeout 15 systemctl --user "$@"; }
+case "$(uname -r | tr '[:upper:]' '[:lower:]')" in *microsoft*) grove_wsl=1 ;; esac
+grove_cr=$(printf '\r')
+safe_path() {
+  case "$1" in /*) ;; *) fail 'installation paths must be absolute' ;; esac
+  case "/$1/" in */../*|*/./*) fail 'installation paths cannot contain dot components' ;; esac
+  # Line breaks cannot be represented safely in unit or shell configuration.
+  case "$1" in *'
+'*|*"$grove_cr"*) fail 'installation paths cannot contain line breaks' ;; esac
+  grove_check=$1
+  while [ "$grove_check" != / ]; do
+    [ ! -L "$grove_check" ] || fail "refusing symlink: $grove_check"
+    grove_check=$(dirname -- "$grove_check")
+  done
+  if [ "$grove_wsl" = 1 ]; then
+    case "$1" in /mnt/*) fail 'WSL installation requires Linux filesystem storage, outside Windows mounts' ;; esac
+    grove_existing=$1
+    while [ ! -e "$grove_existing" ]; do grove_existing=$(dirname -- "$grove_existing"); done
+    command -v findmnt >/dev/null 2>&1 || fail 'findmnt is required to verify WSL Linux filesystem storage'
+    grove_existing=$(CDPATH= cd -- "$grove_existing" 2>/dev/null && pwd -P) || grove_existing=$(CDPATH= cd -- "$(dirname -- "$grove_existing")" && pwd -P)
+    case "$grove_existing" in /mnt/*) fail 'WSL installation requires Linux filesystem storage' ;; esac
+    grove_fs=$(findmnt -n -o FSTYPE -T "$grove_existing") || fail 'cannot verify WSL installation filesystem'
+    case "$grove_fs" in drvfs|9p|ntfs|ntfs3|fuseblk) fail 'WSL installation requires Linux filesystem storage' ;; esac
+  fi
+}
+for grove_path in "$grove_data" "$grove_binary" "$grove_helper" "$grove_manager_file" "$grove_data/service.lock" "$grove_logs/stdout.log" "$grove_logs/stderr.log" "$grove_unit"; do safe_path "$grove_path"; done
+if [ -e "$grove_manager_file" ]; then
+  [ -f "$grove_manager_file" ] || fail 'service manager record is not a regular file'
+  grove_manager=$(cat "$grove_manager_file")
+  case "$grove_manager" in systemd|background) ;; *) fail 'invalid service manager record; saved data is preserved' ;; esac
+elif [ "${1:-}" = install ] || [ "${1:-}" = preflight ]; then
+  [ ! -e "$grove_binary" ] && [ ! -e "$grove_helper" ] || fail 'installation files exist without a service manager record; refusing unowned files'
+  if command -v systemctl >/dev/null 2>&1 && userctl show-environment >/dev/null 2>&1; then
+    grove_manager=systemd
+  else grove_manager=background; fi
+else fail 'service is not installed; run the installer first'; fi
+if [ -e "$grove_unit" ]; then
+  [ -f "$grove_unit" ] && [ "$(head -n 1 "$grove_unit")" = '# Herdr Grove installer-owned: local.herdr-grove' ] || fail 'unrelated systemd user unit exists; saved data is preserved'
+  [ "$grove_manager" = systemd ] || fail 'background owner conflicts with an existing systemd unit'
+fi
+if [ "$grove_manager" = systemd ]; then
+  command -v systemctl >/dev/null 2>&1 && userctl show-environment >/dev/null 2>&1 || fail 'recorded systemd user manager is unavailable; ownership was not changed'
+  grove_loaded=$(userctl show "$grove_unit_name" --property=FragmentPath --value) || fail 'cannot inspect the systemd unit owner'
+  [ -z "$grove_loaded" ] || [ "$grove_loaded" = "$grove_unit" ] || fail 'service label is already loaded from an unrelated systemd unit'
+fi
+for grove_path in "$grove_binary" "$grove_helper" "$grove_data/service.lock" "$grove_logs/stdout.log" "$grove_logs/stderr.log"; do
+  [ ! -e "$grove_path" ] || [ -f "$grove_path" ] || fail "not a regular file: $grove_path"
+done
+owner_free() {
+  if [ -f "$grove_data/service.lock" ]; then
+    timeout 9 flock -n "$grove_data/service.lock" -c ':'
+  else [ ! -e "$grove_data/control.sock" ]; fi
+}
+ready() { timeout 9 "$grove_binary" status --state-dir "$grove_data" >/dev/null 2>&1; }
+wait_ready() {
+  grove_deadline=$(( $(date +%s) + 10 ))
+  until ready; do
+    [ "$(date +%s)" -lt "$grove_deadline" ] || fail 'service did not become ready; inspect grove-service logs'
+    sleep 0.2
+  done
+}
+wait_stopped() {
+  grove_deadline=$(( $(date +%s) + 10 ))
+  while [ -e "$grove_data/control.sock" ]; do
+    [ "$(date +%s)" -lt "$grove_deadline" ] || fail 'service is still stopping; do not replace or start another owner'
+    sleep 0.2
+  done
+}
+stop_job() {
+  if [ "$grove_manager" = systemd ]; then
+    if [ -f "$grove_unit" ]; then userctl stop "$grove_unit_name" || fail 'systemd stop failed'; fi
+  elif ready; then
+    timeout 20 "$grove_binary" shutdown --state-dir "$grove_data" >/dev/null || fail 'shutdown was not confirmed; nothing was killed'
+    wait_stopped
+  elif ! owner_free; then
+    fail 'service control is unavailable while an owner holds its lock; inspect logs before replacing the owner'
+  fi
+}
+start_job() {
+  [ -x "$grove_binary" ] || fail 'installed binary is missing'
+  if ready; then return; fi
+  if [ "$grove_manager" = systemd ]; then
+    [ -f "$grove_unit" ] || fail 'owned systemd unit is missing'
+    userctl start "$grove_unit_name" || fail 'systemd start failed'
+  else
+    owner_free || fail 'service control is unavailable while an owner holds its lock; no competing process was started'
+    nohup "$grove_binary" serve --state-dir "$grove_data" --port "$grove_port" --quiet </dev/null >>"$grove_logs/stdout.log" 2>>"$grove_logs/stderr.log" &
+  fi
+  wait_ready
+}
+# Quote systemd strings and escape % specifiers; ExecStart=: disables $ expansion.
+unit_quote() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g'; }
+case "${1:-help}" in
+  preflight) ;;
+  install)
+    grove_here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+    grove_source=${2:-"$(CDPATH= cd -- "$grove_here/../.." && pwd -P)/target/release/grove"}
+    [ -f "$grove_source" ] && [ -x "$grove_source" ] && [ ! -L "$grove_source" ] || fail 'build cargo build --release --locked first, or install a prebuilt package'
+    safe_path "$grove_source"
+    mkdir -p "$grove_data/bin" "$grove_logs"
+    chmod 700 "$grove_data" "$grove_data/bin" "$grove_logs"
+    touch "$grove_logs/stdout.log" "$grove_logs/stderr.log"
+    chmod 600 "$grove_logs/stdout.log" "$grove_logs/stderr.log"
+    grove_stage=$(mktemp -d "$grove_data/bin/.install.XXXXXX")
+    trap 'rm -rf "$grove_stage"' EXIT
+    trap 'exit 130' HUP INT TERM
+    cp "$grove_source" "$grove_stage/grove"
+    cp "$0" "$grove_stage/grove-service"
+    chmod 700 "$grove_stage/grove" "$grove_stage/grove-service"
+    if [ "$grove_manager" = systemd ]; then
+      # Argument quoting is separate from shell quoting; no shell executes this.
+      printf '# Herdr Grove installer-owned: local.herdr-grove\n[Unit]\nDescription=Herdr Grove agent monitor\n[Service]\nType=simple\nExecStart=:"%s" serve --state-dir "%s" --port %s --quiet\nRestart=on-failure\nRestartSec=2\nUMask=0077\n[Install]\nWantedBy=default.target\n' "$(unit_quote "$grove_binary")" "$(unit_quote "$grove_data")" "$grove_port" > "$grove_stage/service.unit"
+    else command -v nohup >/dev/null 2>&1 || fail 'nohup is required for background mode'; fi
+    stop_job
+    mv "$grove_stage/grove" "$grove_binary"
+    mv "$grove_stage/grove-service" "$grove_helper"
+    printf '%s\n' "$grove_manager" > "$grove_stage/manager"
+    mv "$grove_stage/manager" "$grove_manager_file"
+    if [ "$grove_manager" = systemd ]; then
+      mkdir -p "$(dirname -- "$grove_unit")"
+      mv "$grove_stage/service.unit" "$grove_unit"
+      userctl daemon-reload || fail 'systemd reload failed'
+      userctl enable "$grove_unit_name" || fail 'systemd enable failed'
+    else
+      echo 'Background mode: no automatic login startup or crash restart; opening Grove starts it again.'
+    fi
+    start_job
+    echo "Installed Grove ($grove_manager). Saved data remains in $grove_data."
+    ;;
+  start) start_job ;;
+  stop) stop_job; echo 'Grove stopped. Saved data is preserved.' ;;
+  restart) stop_job; start_job ;;
+  status) if [ "$grove_manager" = systemd ]; then userctl status "$grove_unit_name"; fi; "$grove_binary" status --state-dir "$grove_data" ;;
+  logs) if [ "$grove_manager" = systemd ]; then journalctl --user -u "$grove_unit_name" -n 80 --no-pager; else tail -n 80 "$grove_logs/stderr.log"; fi ;;
+  uninstall)
+    stop_job
+    if [ "$grove_manager" = systemd ]; then
+      userctl disable "$grove_unit_name" || fail 'systemd disable failed'
+      rm -f "$grove_unit"
+      userctl daemon-reload || fail 'systemd reload failed'
+    fi
+    rm -f "$grove_binary" "$grove_helper" "$grove_manager_file"
+    echo "Service removed. Journals, assets, configuration and logs preserved in $grove_data."
+    ;;
+  *) echo 'Usage: grove-service install [BINARY] | start | stop | restart | status | logs | uninstall'; exit 1 ;;
+esac

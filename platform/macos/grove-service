@@ -1,0 +1,114 @@
+#!/bin/sh
+# One launchd owner; the plugin only attaches and opens an existing service.
+set -eu
+umask 077
+
+if [ "$(uname -s)" != Darwin ]; then
+  echo 'This service helper requires macOS. Use grove serve on Linux.' >&2
+  exit 1
+fi
+
+grove_data=${GROVE_DATA_DIR:-"$HOME/Library/Application Support/Herdr Grove"}
+grove_agents=${GROVE_LAUNCH_AGENTS_DIR:-"$HOME/Library/LaunchAgents"}
+grove_label=${GROVE_SERVICE_LABEL:-local.herdr-grove}
+grove_port=${GROVE_PORT:-43821}
+case "$grove_label" in local.herdr-grove|local.herdr-grove.*) ;; *) echo 'Invalid Grove service label' >&2; exit 1;; esac
+case "$grove_label" in *[!a-zA-Z0-9._-]*) echo 'Invalid Grove service label' >&2; exit 1;; esac
+case "$grove_port" in ''|*[!0-9]*) echo 'Invalid port' >&2; exit 1;; esac
+[ "$grove_port" -le 65535 ] || { echo 'Invalid port' >&2; exit 1; }
+for grove_path in "$grove_data" "$grove_agents"; do
+  case "$grove_path" in /*) ;; *) echo 'Service paths must be absolute' >&2; exit 1;; esac
+done
+grove_domain="gui/$(id -u)"
+grove_job="$grove_domain/$grove_label"
+grove_plist="$grove_agents/$grove_label.plist"
+grove_binary="$grove_data/bin/grove"
+grove_helper="$grove_data/bin/grove-service"
+grove_logs="$grove_data/logs"
+
+stop_job() {
+  if launchctl print "$grove_job" >/dev/null 2>&1; then
+    launchctl bootout "$grove_job"
+    grove_wait=0
+    while launchctl print "$grove_job" >/dev/null 2>&1; do
+      grove_wait=$((grove_wait + 1))
+      [ "$grove_wait" -lt 100 ] || { echo 'Grove is still stopping; retry shortly.' >&2; exit 1; }
+      sleep 0.1
+    done
+  fi
+}
+start_job() {
+  [ -f "$grove_plist" ] && [ -x "$grove_binary" ] || {
+    echo 'Grove service is not installed. Run grove-service install BINARY.' >&2; exit 1;
+  }
+  if ! launchctl print "$grove_job" >/dev/null 2>&1; then
+    launchctl bootstrap "$grove_domain" "$grove_plist"
+  fi
+  # launchd loading a job precedes the service binding its control socket.
+  grove_deadline=$(( $(date +%s) + 10 ))
+  until "$grove_binary" status --state-dir "$grove_data" >/dev/null 2>&1; do
+    [ "$(date +%s)" -lt "$grove_deadline" ] || { echo 'Grove service did not become ready; inspect grove-service logs and retry.' >&2; exit 1; }
+    sleep 0.2
+  done
+}
+
+case "${1:-help}" in
+  install)
+    grove_here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    grove_source=${2:-"$grove_here/../../target/release/grove"}
+    [ -f "$grove_source" ] && [ -x "$grove_source" ] || {
+      echo 'Build first: cargo build --release --locked; then install the executable.' >&2; exit 1;
+    }
+    # Refuse redirecting installation through symlinks into unrelated files.
+    for grove_path in "$grove_data" "$grove_data/bin" "$grove_agents" "$grove_logs" "$grove_logs/stdout.log" "$grove_logs/stderr.log" "$grove_plist" "$grove_binary" "$grove_helper"; do
+      [ ! -L "$grove_path" ] || { echo 'Refusing a symlink in the installation paths' >&2; exit 1; }
+    done
+    mkdir -p "$grove_data/bin" "$grove_logs" "$grove_agents"
+    chmod 700 "$grove_data" "$grove_data/bin" "$grove_logs"
+    touch "$grove_logs/stdout.log" "$grove_logs/stderr.log"
+    chmod 600 "$grove_logs/stdout.log" "$grove_logs/stderr.log"
+    grove_stage=$(mktemp -d "$grove_data/bin/.install.XXXXXX")
+    trap 'rm -f "$grove_stage/grove" "$grove_stage/grove-service" "$grove_stage/service.plist"; rmdir "$grove_stage"' EXIT
+    trap 'exit 130' HUP INT TERM
+    cp "$grove_source" "$grove_stage/grove"
+    cp "$0" "$grove_stage/grove-service"
+    chmod 700 "$grove_stage/grove" "$grove_stage/grove-service"
+    grove_temp="$grove_stage/service.plist"
+    plutil -create xml1 "$grove_temp"
+    plutil -insert Label -string "$grove_label" "$grove_temp"
+    plutil -insert ProgramArguments -array "$grove_temp"
+    plutil -insert ProgramArguments.0 -string "$grove_binary" "$grove_temp"
+    plutil -insert ProgramArguments.1 -string serve "$grove_temp"
+    plutil -insert ProgramArguments.2 -string --state-dir "$grove_temp"
+    plutil -insert ProgramArguments.3 -string "$grove_data" "$grove_temp"
+    plutil -insert ProgramArguments.4 -string --port "$grove_temp"
+    plutil -insert ProgramArguments.5 -string "$grove_port" "$grove_temp"
+    plutil -insert ProgramArguments.6 -string --quiet "$grove_temp"
+    plutil -insert RunAtLoad -bool true "$grove_temp"
+    plutil -insert KeepAlive -bool true "$grove_temp"
+    plutil -insert ThrottleInterval -integer 10 "$grove_temp"
+    plutil -insert ProcessType -string Background "$grove_temp"
+    plutil -insert Umask -integer 63 "$grove_temp"
+    plutil -insert StandardOutPath -string "$grove_logs/stdout.log" "$grove_temp"
+    plutil -insert StandardErrorPath -string "$grove_logs/stderr.log" "$grove_temp"
+    plutil -lint "$grove_temp" >/dev/null
+    stop_job
+    mv "$grove_stage/grove" "$grove_binary"
+    mv "$grove_stage/grove-service" "$grove_helper"
+    mv "$grove_temp" "$grove_plist"
+    start_job
+    echo "Installed $grove_label. Assets and journal stay in $grove_data."
+    echo "Use $grove_helper status to inspect the service."
+    ;;
+  start) start_job ;;
+  stop) stop_job; echo 'Grove stopped. Saved data is preserved.' ;;
+  restart) start_job; launchctl kickstart -k "$grove_job" ;;
+  status) launchctl print "$grove_job"; "$grove_binary" status --state-dir "$grove_data" ;;
+  logs) tail -n 80 "$grove_logs/stderr.log" ;;
+  uninstall)
+    stop_job
+    rm -f "$grove_plist" "$grove_binary" "$grove_helper"
+    echo "Service removed. Journals, assets, configuration and logs preserved in $grove_data."
+    ;;
+  *) echo 'Usage: grove-service install [BINARY] | start | stop | restart | status | logs | uninstall'; exit 1 ;;
+esac
