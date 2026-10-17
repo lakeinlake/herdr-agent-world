@@ -5,6 +5,21 @@ Watch your coding agents work as animated characters.
 See live activity in your Herdr workspace, choose from 30 bundled Pokémon,
 and switch between Forest, Coast and Town scenes. The monitor runs locally.
 
+[![Herdr Agent World in the Forest scene, showing Pikachu, Eevee and Bulbasaur as three sample agents](https://raw.githubusercontent.com/lakeinlake/herdr-agent-world/main/docs/screenshots/forest.png)](https://github.com/lakeinlake/herdr-agent-world/blob/main/docs/screenshots/forest.png)
+
+*Your agents, a little more alive. Forest scene with clearly labeled sample
+agents and activity. Click either screenshot to view it at full size.*
+
+<details>
+<summary>See the Coast scene</summary>
+
+[![The same sample workspace in the Coast scene, with a sandy beach, Pokémon decorations and a ferry](https://raw.githubusercontent.com/lakeinlake/herdr-agent-world/main/docs/screenshots/coast.png)](https://github.com/lakeinlake/herdr-agent-world/blob/main/docs/screenshots/coast.png)
+
+*Same workspace, a change of scenery. Screenshots show the actual interface
+using the read-only sample preview; no live workspace data is shown.*
+
+</details>
+
 ## Install
 
 Requires **Herdr 0.8.0+**, Git, curl, and macOS, Linux or WSL2 on Apple Silicon,
