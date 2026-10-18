@@ -7,7 +7,7 @@ and switch between Forest, Coast and Town scenes. The monitor runs locally.
 
 https://github.com/user-attachments/assets/d371e167-9334-4b35-8b8a-524b334e2d52
 
-**[Watch the 30-second demo](https://github.com/user-attachments/assets/d371e167-9334-4b35-8b8a-524b334e2d52)** — animated companions, scene switching,
+**[Watch the 30-second demo](https://github.com/lakeinlake/herdr-agent-world#readme)** — animated companions, scene switching,
 agent details and message-label controls. Recorded from the actual interface
 with clearly labeled sample data; this is not a live-agent session.
 
